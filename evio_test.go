@@ -6,11 +6,14 @@ package evio
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +38,17 @@ func TestServe(t *testing.T) {
 			})
 			t.Run("N-loop", func(t *testing.T) {
 				testServe("tcp-net", ":9999", false, 10, -1, RoundRobin)
+			})
+		})
+		t.Run("tls", func(t *testing.T) {
+			t.Run("tls-1-loop", func(t *testing.T) {
+				testServe("tcp-net", "127.0.0.1:9991?tls=true", false, 10, 1, Random)
+			})
+			t.Run("tls-5-loop", func(t *testing.T) {
+				testServe("tcp-net", "127.0.0.1:9992?tls=true", false, 10, 5, LeastConnections)
+			})
+			t.Run("tls-N-loop", func(t *testing.T) {
+				testServe("tcp-net", "127.0.0.1:9993?tls=true", false, 10, -1, RoundRobin)
 			})
 		})
 		t.Run("unix", func(t *testing.T) {
@@ -84,6 +98,7 @@ func testServe(network, addr string, unix bool, nclients, nloops int, balance Lo
 	var events Events
 	events.LoadBalance = balance
 	events.NumLoops = nloops
+	events.TLS, _, _ = tlsConfig(addr, true)
 	events.Serving = func(srv Server) (action Action) {
 		return
 	}
@@ -143,7 +158,7 @@ func startClient(network, addr string, nloops int) {
 	onetwork := network
 	network = strings.Replace(network, "-net", "", -1)
 	rand.Seed(time.Now().UnixNano())
-	c, err := net.Dial(network, addr)
+	c, err := dial(network, addr)
 	if err != nil {
 		panic(err)
 	}
@@ -176,6 +191,31 @@ func startClient(network, addr string, nloops int) {
 			//panic("mismatch")
 		}
 	}
+}
+
+func dial(network, addr string) (net.Conn, error) {
+	if tc, dlAddr, ok := tlsConfig(addr, false); ok {
+		tlsCfg, err := tc.getTlsConfig()
+		if err != nil {
+			return nil, err
+		}
+		return tls.Dial(network, dlAddr, tlsCfg)
+	}
+	return net.Dial(network, addr)
+}
+
+func tlsConfig(addr string, server bool) (TLSConfig, string, bool) {
+	_, da, opts, _ := parseAddr(addr)
+	if !opts.tls {
+		return TLSConfig{}, addr, false
+	}
+
+	_, dir, _, _ := runtime.Caller(0)
+	crtsDir := filepath.Dir(dir) + "/certs4test/"
+	if server {
+		return TLSConfig{ClientAuthType: tls.RequireAndVerifyClientCert, KeysFile: crtsDir + "server0.key", CertsFile: crtsDir + "server0.crt", CaFile: crtsDir + "chain.pem"}, da, true
+	}
+	return TLSConfig{ClientAuthType: tls.RequireAndVerifyClientCert, KeysFile: crtsDir + "client0.key", CertsFile: crtsDir + "client0.crt", CaFile: crtsDir + "chain.pem"}, da, true
 }
 
 func must(err error) {

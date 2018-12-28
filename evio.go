@@ -5,7 +5,11 @@
 package evio
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -93,6 +97,9 @@ type Events struct {
 	// best effort to attempt to distribute the incoming connections between
 	// multiple loops. This option is only works when NumLoops is set.
 	LoadBalance LoadBalance
+	// TLS contains references to TLS resources. The configuration is required
+	// if a connection is going to use TLS
+	TLS TLSConfig
 	// Serving fires when the server can accept connections. The server
 	// parameter has information and various utilities.
 	Serving func(server Server) (action Action)
@@ -124,6 +131,18 @@ type Events struct {
 	Tick func() (delay time.Duration, action Action)
 }
 
+// TLSConfig contains references to TLS resources.
+type TLSConfig struct {
+	// ClientAuthType specifies the client auth type
+	ClientAuthType tls.ClientAuthType
+	// KeysFile is a private key PEM file.
+	KeysFile string
+	// CertsFile is a certificate PEM file
+	CertsFile string
+	// CaFile CA certificates chain PEM file
+	CaFile string
+}
+
 // Serve starts handling events for the specified addresses.
 //
 // Addresses should use a scheme prefix and be formatted
@@ -146,6 +165,7 @@ func Serve(events Events, addr ...string) error {
 		}
 	}()
 	var stdlib bool
+	var tlsCfg *tls.Config
 	for _, addr := range addr {
 		var ln listener
 		var stdlibt bool
@@ -157,6 +177,20 @@ func Serve(events Events, addr ...string) error {
 			os.RemoveAll(ln.addr)
 		}
 		var err error
+		if ln.opts.tls {
+			if ln.opts.reusePort {
+				return fmt.Errorf("TLS is supported for non-reuse port only: addr=\"%s\"", addr)
+			}
+			if ln.network == "udp" {
+				return fmt.Errorf("TLS is supported for TCP networks only: addr=\"%s\"", addr)
+			}
+			if tlsCfg == nil {
+				tlsCfg, err = events.TLS.getTlsConfig()
+				if err != nil {
+					return err
+				}
+			}
+		}
 		if ln.network == "udp" {
 			if ln.opts.reusePort {
 				ln.pconn, err = reuseportListenPacket(ln.network, ln.addr)
@@ -167,7 +201,11 @@ func Serve(events Events, addr ...string) error {
 			if ln.opts.reusePort {
 				ln.ln, err = reuseportListen(ln.network, ln.addr)
 			} else {
-				ln.ln, err = net.Listen(ln.network, ln.addr)
+				if ln.opts.tls {
+					ln.ln, err = tls.Listen(ln.network, ln.addr, tlsCfg)
+				} else {
+					ln.ln, err = net.Listen(ln.network, ln.addr)
+				}
 			}
 		}
 		if err != nil {
@@ -230,6 +268,7 @@ type listener struct {
 
 type addrOpts struct {
 	reusePort bool
+	tls       bool
 }
 
 func parseAddr(addr string) (network, address string, opts addrOpts, stdlib bool) {
@@ -251,18 +290,86 @@ func parseAddr(addr string) (network, address string, opts addrOpts, stdlib bool
 			if len(kv) == 2 {
 				switch kv[0] {
 				case "reuseport":
-					if len(kv[1]) != 0 {
-						switch kv[1][0] {
-						default:
-							opts.reusePort = kv[1][0] >= '1' && kv[1][0] <= '9'
-						case 'T', 't', 'Y', 'y':
-							opts.reusePort = true
-						}
-					}
+					opts.reusePort = parseBool(kv[1])
+				case "tls":
+					opts.tls = parseBool(kv[1])
 				}
 			}
 		}
 		address = address[:q]
 	}
 	return
+}
+
+func parseBool(bVal string) bool {
+	if len(bVal) == 0 {
+		return false
+	}
+
+	switch bVal[0] {
+	default:
+		return bVal[0] >= '1' && bVal[0] <= '9'
+	case 'T', 't', 'Y', 'y':
+		return true
+	}
+}
+
+func (tc *TLSConfig) getTlsConfig() (*tls.Config, error) {
+	cpb, err := readFile(tc.CertsFile)
+	if err != nil {
+		return nil, fmt.Errorf("TLS Config error: Could not read %s file, err=%s", tc.CertsFile, err)
+	}
+
+	kpb, err := readFile(tc.KeysFile)
+	if err != nil {
+		return nil, fmt.Errorf("TLS Config error: Could not read %s file, err=%s", tc.KeysFile, err)
+	}
+
+	rpb, err := readFile(tc.CaFile)
+	if err != nil {
+		return nil, fmt.Errorf("TLS Config error: Could not read %s file, err=%s", tc.CaFile, err)
+	}
+
+	certs, err := tc.getKeyPairCerts(cpb, kpb)
+	if err != nil {
+		return nil, fmt.Errorf("TLS Config error: Could not parse X509 Certificate from the pem encoded data, err=%s", err)
+	}
+
+	rootc, err := tc.getRootCertPool(rpb)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{Certificates: certs, RootCAs: rootc, ClientAuth: tc.ClientAuthType, ClientCAs: rootc}, nil
+}
+
+// readFile reads the file content and returns it as a slice of bytes, or
+// returns nil with error if any.
+func readFile(filename string) ([]byte, error) {
+	if len(filename) == 0 {
+		return nil, nil
+	}
+	return ioutil.ReadFile(filename)
+}
+
+func (tc *TLSConfig) getKeyPairCerts(cpb, kpb []byte) ([]tls.Certificate, error) {
+	if len(kpb) != 0 && len(cpb) != 0 {
+		cert, err := tls.X509KeyPair(cpb, kpb)
+		if err != nil {
+			return []tls.Certificate{}, err
+		}
+		return []tls.Certificate{cert}, nil
+	}
+	return []tls.Certificate{}, nil
+}
+
+func (tc *TLSConfig) getRootCertPool(rpb []byte) (*x509.CertPool, error) {
+	if len(rpb) != 0 {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(rpb) {
+			return nil, fmt.Errorf("TLS Config error: Could not create Root Cert Pool, is the CA certificates chain incorrect?")
+		}
+		return roots, nil
+	}
+	return x509.SystemCertPool()
 }
